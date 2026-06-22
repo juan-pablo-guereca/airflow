@@ -559,6 +559,11 @@ class AirflowKubernetesScheduler(LoggingMixin):
         kube_executor_config = next_job.kube_executor_config
         pod_template_file = next_job.pod_template_file
 
+        # ``execute_async`` serializes the ``pod_override`` to a dict so it can be pickled onto the
+        # multiprocessing queue (a live in-cluster ``V1Pod`` is not picklable). Rebuild the ``V1Pod`` here.
+        if isinstance(kube_executor_config, dict):
+            kube_executor_config = PodGenerator.deserialize_model_dict(kube_executor_config)
+
         dag_id, task_id, run_id, try_number, map_index = key
         if len(command) == 1:
             from airflow.executors.workloads import ExecuteTask

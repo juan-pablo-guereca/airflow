@@ -226,6 +226,21 @@ class KubernetesExecutor(BaseExecutor):
             pod_template_file = executor_config.get("pod_template_file", None)
         else:
             pod_template_file = None
+
+        # Serialize any ``pod_override`` ``V1Pod`` to a plain dict before putting it on the
+        # multiprocessing queue. When the scheduler runs in-cluster, the kubernetes client attaches an
+        # in-cluster ``Configuration`` to every ``V1Pod`` whose ``refresh_api_key_hook`` is a local
+        # closure (``InClusterConfigLoader._set_config.<locals>._refresh_api_key``). ``pickle`` cannot
+        # serialize a local closure, so queuing a live ``V1Pod`` raises ``PicklingError`` and crashes the
+        # scheduler. ``run_next`` deserializes the dict back into a ``V1Pod`` worker-side. The same
+        # ``V1Pod`` object is also referenced by the workload's ``executor_config``, so sanitize that copy
+        # too (it is otherwise pickled as part of the workload, even though the worker rebuilds the pod
+        # override from ``kube_executor_config``).
+        if kube_executor_config is not None:
+            kube_executor_config = PodGenerator.serialize_pod(kube_executor_config)
+        if executor_config and executor_config.get("pod_override") is not None:
+            executor_config["pod_override"] = PodGenerator.serialize_pod(executor_config["pod_override"])
+
         self.event_buffer[key] = (TaskInstanceState.QUEUED, self.scheduler_job_id)
         self.task_queue.put(KubernetesJob(key, command, kube_executor_config, pod_template_file))
         # We keep a temporary local record that we've handled this so we don't

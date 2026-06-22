@@ -865,8 +865,10 @@ class TestKubernetesExecutor:
                 task = executor.task_queue.get_nowait()
                 _, _, expected_executor_config, expected_pod_template_file = task
                 executor.task_queue.task_done()
-                # Test that the correct values have been put to queue
-                assert expected_executor_config.metadata.labels == {"release": "stable"}
+                # ``pod_override`` is serialized to a dict before being queued so it can be pickled onto
+                # the multiprocessing queue (a live in-cluster ``V1Pod`` is not picklable).
+                assert isinstance(expected_executor_config, dict)
+                assert expected_executor_config["metadata"]["labels"] == {"release": "stable"}
                 assert expected_pod_template_file == executor_template_file
 
                 self.kubernetes_executor.kube_scheduler.run_next(task)
@@ -914,6 +916,67 @@ class TestKubernetesExecutor:
                 )
             finally:
                 executor.end()
+
+    @mock.patch("airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils.KubernetesJobWatcher")
+    @mock.patch("airflow.providers.cncf.kubernetes.kube_client.get_kube_client")
+    def test_execute_async_queues_picklable_pod_override(
+        self, mock_get_kube_client, mock_kubernetes_job_watcher
+    ):
+        """Regression: a ``pod_override`` carrying an in-cluster ``Configuration`` must be picklable.
+
+        When the scheduler runs in-cluster, the kubernetes client attaches a ``Configuration`` whose
+        ``refresh_api_key_hook`` is a local closure (``InClusterConfigLoader._set_config.<locals>.
+        _refresh_api_key``). ``pickle`` cannot serialize a local closure, so putting a live ``V1Pod`` on
+        the multiprocessing queue raised ``PicklingError`` and crashed the scheduler. ``execute_async``
+        must serialize the pod to a dict so the queued ``KubernetesJob`` pickles cleanly.
+        """
+        import pickle
+
+        from kubernetes.client import Configuration
+
+        pod_override = k8s.V1Pod(
+            metadata=k8s.V1ObjectMeta(labels={"release": "stable"}),
+            spec=k8s.V1PodSpec(containers=[k8s.V1Container(name="base", image="airflow:3.6")]),
+        )
+
+        # Simulate the in-cluster config: an unpicklable local closure on the pod's Configuration.
+        def _make_unpicklable_hook():
+            def _refresh_api_key(config):
+                return None
+
+            return _refresh_api_key
+
+        cfg = Configuration()
+        cfg.refresh_api_key_hook = _make_unpicklable_hook()
+        pod_override.metadata.local_vars_configuration = cfg
+
+        # Sanity check: the raw pod is indeed not picklable (reproduces the crash pre-fix).
+        with pytest.raises((pickle.PicklingError, AttributeError, TypeError)):
+            pickle.dumps(pod_override)
+
+        executor = self.kubernetes_executor
+        executor.start()
+        try:
+            executor.execute_async(
+                key=TaskInstanceKey("dag", "task", "run_id", 1, -1),
+                queue=None,
+                command=["airflow", "tasks", "run", "true", "some_parameter"],
+                executor_config={"pod_override": pod_override},
+            )
+            assert not executor.task_queue.empty()
+            job = executor.task_queue.get_nowait()
+            executor.task_queue.task_done()
+
+            # The queued job (and its serialized pod_override) must pickle without error.
+            pickle.dumps(job)
+            assert isinstance(job.kube_executor_config, dict)
+            assert job.kube_executor_config["metadata"]["labels"] == {"release": "stable"}
+
+            # And run_next must be able to rebuild a V1Pod from the serialized dict.
+            rebuilt = pod_generator.PodGenerator.deserialize_model_dict(job.kube_executor_config)
+            assert rebuilt.metadata.labels == {"release": "stable"}
+        finally:
+            executor.end()
 
     @pytest.mark.db_test
     @mock.patch("airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils.KubernetesJobWatcher")
